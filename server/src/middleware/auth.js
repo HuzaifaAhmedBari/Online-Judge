@@ -47,6 +47,53 @@ async function authenticate(req, res, next) {
 }
 
 /**
+ * Optional authentication middleware for public routes whose response can be
+ * richer when a valid logged-in user is present.
+ *
+ * No Authorization header means anonymous access. A malformed or invalid token
+ * still returns 401 because the client attempted to authenticate and failed.
+ */
+async function optionalAuthenticate(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return next();
+    }
+
+    if (!authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Invalid Authorization header. Use Bearer token.' });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const decoded = verifyToken(token);
+
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.id },
+      select: {
+        id: true,
+        username: true,
+        email: true,
+        role: true,
+        is_banned: true,
+        banned_reason: true,
+      },
+    });
+
+    if (!user) {
+      return res.status(401).json({ error: 'User no longer exists.' });
+    }
+
+    req.user = user;
+    next();
+  } catch (err) {
+    if (err.name === 'JsonWebTokenError' || err.name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Invalid or expired token.' });
+    }
+    next(err);
+  }
+}
+
+/**
  * Ban-check middleware — rejects with 403 if the authenticated user is banned.
  * Must be used after authenticate().
  *
@@ -64,4 +111,4 @@ function requireNotBanned(req, res, next) {
   next();
 }
 
-module.exports = { authenticate, requireNotBanned };
+module.exports = { authenticate, optionalAuthenticate, requireNotBanned };
