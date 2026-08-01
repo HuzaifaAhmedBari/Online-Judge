@@ -1,0 +1,314 @@
+// Online Judge Platform — Full Prisma Schema
+// Maps 1:1 to Section 4 of the spec (every table, every field)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ─── Enums ──────────────────────────────────────────────────────────
+
+enum UserRole {
+  participant
+  author
+  admin
+}
+
+enum RoleRequestStatus {
+  pending
+  approved
+  denied
+}
+
+enum CheckerType {
+  token
+  float
+  custom
+}
+
+enum ProblemVisibility {
+  public
+  private
+}
+
+enum ContestVisibility {
+  public
+  private
+  restricted
+}
+
+enum SubmissionStatus {
+  queued
+  judging
+  done
+}
+
+enum Verdict {
+  AC
+  WA
+  TLE
+  MLE
+  RE
+  CE
+}
+
+enum Language {
+  python
+  cpp
+  java
+}
+
+// ─── Tables ─────────────────────────────────────────────────────────
+
+/// users
+///   id, username, email, password_hash,
+///   role ('participant' | 'author' | 'admin'),
+///   is_banned (bool, default false), banned_reason (nullable), banned_at (nullable),
+///   created_at
+model User {
+  id            String    @id @default(uuid())
+  username      String    @unique
+  email         String    @unique
+  password_hash String
+  role          UserRole  @default(participant)
+  is_banned     Boolean   @default(false)
+  banned_reason String?
+  banned_at     DateTime?
+  created_at    DateTime  @default(now())
+
+  // Relations
+  role_requests_made    RoleRequest[]       @relation("RequestedBy")
+  role_requests_reviewed RoleRequest[]      @relation("ReviewedBy")
+  problems_created      Problem[]           @relation("ProblemCreator")
+  contests_created      Contest[]           @relation("ContestCreator")
+  contest_access        ContestAccess[]
+  contest_sessions      ContestSession[]
+  submissions           Submission[]
+  first_blood_overrides FirstBloodOverride[] @relation("OverriddenBy")
+  system_settings_updated SystemSettings[]  @relation("SettingsUpdatedBy")
+
+  @@map("users")
+}
+
+/// role_requests
+///   id, user_id, status ('pending' | 'approved' | 'denied'),
+///   requested_at, reviewed_by (nullable, references users.id), reviewed_at (nullable)
+model RoleRequest {
+  id           String            @id @default(uuid())
+  user_id      String
+  status       RoleRequestStatus @default(pending)
+  requested_at DateTime          @default(now())
+  reviewed_by  String?
+  reviewed_at  DateTime?
+
+  // Relations
+  user     User  @relation("RequestedBy", fields: [user_id], references: [id])
+  reviewer User? @relation("ReviewedBy", fields: [reviewed_by], references: [id])
+
+  @@map("role_requests")
+}
+
+/// problems
+///   id, title, statement_md, time_limit_ms, memory_limit_kb,
+///   checker_type ('token' | 'float' | 'custom'), checker_source (nullable),
+///   visibility ('public' | 'private', default 'public'),
+///   created_by, created_at, updated_at
+model Problem {
+  id              String            @id @default(uuid())
+  title           String
+  statement_md    String
+  time_limit_ms   Int
+  memory_limit_kb Int
+  checker_type    CheckerType       @default(token)
+  checker_source  String?
+  visibility      ProblemVisibility  @default(public)
+  created_by      String
+  created_at      DateTime          @default(now())
+  updated_at      DateTime          @updatedAt
+
+  // Relations
+  creator          User              @relation("ProblemCreator", fields: [created_by], references: [id])
+  testcases        Testcase[]
+  contest_problems ContestProblem[]
+  submissions      Submission[]
+  first_blood_overrides FirstBloodOverride[]
+
+  @@map("problems")
+}
+
+/// system_settings
+///   id (singleton row), disable_non_contest_submissions (bool, default false),
+///   updated_by (references users.id), updated_at
+model SystemSettings {
+  id                              String   @id @default(uuid())
+  disable_non_contest_submissions Boolean  @default(false)
+  updated_by                      String?
+  updated_at                      DateTime @updatedAt
+
+  // Relations
+  updater User? @relation("SettingsUpdatedBy", fields: [updated_by], references: [id])
+
+  @@map("system_settings")
+}
+
+/// testcases
+///   id, problem_id, input_path, output_path, is_sample (bool), ordinal
+model Testcase {
+  id          String  @id @default(uuid())
+  problem_id  String
+  input_path  String
+  output_path String
+  is_sample   Boolean @default(false)
+  ordinal     Int
+
+  // Relations
+  problem Problem @relation(fields: [problem_id], references: [id], onDelete: Cascade)
+
+  @@map("testcases")
+}
+
+/// contests
+///   id, title, start_time, end_time, created_by,
+///   visibility ('public' | 'private' | 'restricted', default 'public'),
+///   password_hash (nullable — only meaningful when visibility = 'private'),
+///   penalty_minutes_per_wrong (int, default 20)
+model Contest {
+  id                       String            @id @default(uuid())
+  title                    String
+  start_time               DateTime
+  end_time                 DateTime
+  created_by               String
+  visibility               ContestVisibility @default(public)
+  password_hash            String?
+  penalty_minutes_per_wrong Int              @default(20)
+
+  // Relations
+  creator           User                @relation("ContestCreator", fields: [created_by], references: [id])
+  contest_access    ContestAccess[]
+  contest_problems  ContestProblem[]
+  contest_sessions  ContestSession[]
+  submissions       Submission[]
+  final_results     ContestFinalResult?
+  first_blood_overrides FirstBloodOverride[]
+
+  @@map("contests")
+}
+
+/// contest_access
+///   user_id, contest_id, granted_at
+///   PRIMARY KEY (user_id, contest_id)
+model ContestAccess {
+  user_id    String
+  contest_id String
+  granted_at DateTime @default(now())
+
+  // Relations
+  user    User    @relation(fields: [user_id], references: [id])
+  contest Contest @relation(fields: [contest_id], references: [id], onDelete: Cascade)
+
+  @@id([user_id, contest_id])
+  @@map("contest_access")
+}
+
+/// contest_final_results
+///   contest_id (unique, references contests.id),
+///   results_json (text/jsonb — the full computed final leaderboard),
+///   finalized_at
+model ContestFinalResult {
+  contest_id   String   @unique
+  results_json String
+  finalized_at DateTime @default(now())
+
+  // Relations
+  contest Contest @relation(fields: [contest_id], references: [id], onDelete: Cascade)
+
+  @@map("contest_final_results")
+}
+
+/// first_blood_overrides
+///   contest_id, problem_id, user_id, overridden_by (references users.id), overridden_at
+///   PRIMARY KEY (contest_id, problem_id)
+model FirstBloodOverride {
+  contest_id    String
+  problem_id    String
+  user_id       String
+  overridden_by String
+  overridden_at DateTime @default(now())
+
+  // Relations
+  contest  Contest @relation(fields: [contest_id], references: [id], onDelete: Cascade)
+  problem  Problem @relation(fields: [problem_id], references: [id], onDelete: Cascade)
+  override_admin User @relation("OverriddenBy", fields: [overridden_by], references: [id])
+
+  @@id([contest_id, problem_id])
+  @@map("first_blood_overrides")
+}
+
+/// contest_sessions
+///   id, user_id, contest_id, device_id, ip_address, user_agent,
+///   first_seen, last_seen, connection_count
+model ContestSession {
+  id               String   @id @default(uuid())
+  user_id          String
+  contest_id       String
+  device_id        String
+  ip_address       String
+  user_agent       String
+  first_seen       DateTime @default(now())
+  last_seen        DateTime @default(now())
+  connection_count Int      @default(1)
+
+  // Relations
+  user    User    @relation(fields: [user_id], references: [id])
+  contest Contest @relation(fields: [contest_id], references: [id], onDelete: Cascade)
+
+  @@unique([user_id, contest_id, device_id])
+  @@map("contest_sessions")
+}
+
+/// contest_problems
+///   contest_id, problem_id, label (A, B, C, ...)
+model ContestProblem {
+  contest_id String
+  problem_id String
+  label      String
+
+  // Relations
+  contest Contest @relation(fields: [contest_id], references: [id], onDelete: Cascade)
+  problem Problem @relation(fields: [problem_id], references: [id], onDelete: Cascade)
+
+  @@id([contest_id, problem_id])
+  @@map("contest_problems")
+}
+
+/// submissions
+///   id, user_id, problem_id, contest_id (nullable),
+///   language ('python' | 'cpp' | 'java'),
+///   source_code, status ('queued'|'judging'|'done'),
+///   verdict ('AC'|'WA'|'TLE'|'MLE'|'RE'|'CE'|null),
+///   time_used_ms, memory_used_kb, submitted_at
+model Submission {
+  id             String           @id @default(uuid())
+  user_id        String
+  problem_id     String
+  contest_id     String?
+  language       Language
+  source_code    String
+  status         SubmissionStatus @default(queued)
+  verdict        Verdict?
+  time_used_ms   Int?
+  memory_used_kb Int?
+  submitted_at   DateTime         @default(now())
+
+  // Relations
+  user    User     @relation(fields: [user_id], references: [id])
+  problem Problem  @relation(fields: [problem_id], references: [id])
+  contest Contest? @relation(fields: [contest_id], references: [id])
+
+  @@map("submissions")
+}
