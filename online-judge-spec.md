@@ -174,6 +174,7 @@ submissions
   language ('python' | 'cpp' | 'java'),
   source_code, status ('queued'|'judging'|'done'),
   verdict ('AC'|'WA'|'TLE'|'MLE'|'RE'|'CE'|null),
+  -- MLE is a DERIVED label, not a raw Judge0 status — see 5.6 for how it's inferred
   time_used_ms, memory_used_kb, submitted_at
 ```
 
@@ -332,9 +333,10 @@ Worker pulls job
   → fetch problem + testcases from Postgres
   → for each testcase:
       - send code + input + limits to Judge0
-      - poll Judge0 for result (stdout, exit code, time, memory)
-      - if non-zero exit / timeout / OOM → verdict = RE/TLE/MLE, stop
-      - else run checker(input, user_output, expected_output) → AC or WA, stop on WA
+      - poll Judge0 for result (Judge0 status ID, stdout, exit code, time, peak memory)
+      - map Judge0's status to a verdict (see "Verdict mapping" below — MLE is inferred, not a raw status)
+      - stop on the first non-AC verdict (RE/TLE/MLE/CE/WA)
+      - else (Judge0 status = Accepted) run checker(input, user_output, expected_output) → AC or WA, stop on WA
   → write final verdict + resource usage to submissions row (Postgres — always, unconditionally)
   → update scoreboard state (see 5.8) — triggered on EVERY verdict, not just AC:
       - update in-memory per-cell state (wrong count, solved flag, solve time)
@@ -342,6 +344,29 @@ Worker pulls job
       - if verdict === AC: additionally compute penalty and update the Redis sorted set (ranking)
       - broadcast the updated scoreboard via WebSocket to all connected clients
 ```
+
+**Verdict mapping — MLE has no dedicated Judge0 status and must be inferred:**
+
+Judge0 CE's status list has no distinct "Memory Limit Exceeded" ID — a process that exceeds its memory limit gets killed by the OS/sandbox and reported as a **Runtime Error variant** (status IDs 7–12: SIGSEGV, SIGABRT, NZEC, "Other", etc.), same as any other crash. The worker must derive MLE itself:
+
+```javascript
+function mapJudge0StatusToVerdict(judge0Status, memoryUsedKb, memoryLimitKb) {
+  const id = judge0Status.id;
+  if (id === 3) return 'AC_CANDIDATE'; // Accepted by Judge0 — still needs the checker to confirm actual correctness
+  if (id === 4) return 'WA';
+  if (id === 5) return 'TLE';
+  if (id === 6) return 'CE';
+  if (id >= 7 && id <= 12) {
+    // Runtime Error range — infer MLE if peak memory was at/near the configured limit
+    if (memoryUsedKb && memoryUsedKb >= memoryLimitKb * 0.9) return 'MLE';
+    return 'RE'; // genuine runtime error, unrelated to memory
+  }
+  return 'RE'; // status 13/14 (Internal Error/Exec Format Error) — treat as a runtime-side failure
+}
+```
+- The `memory` field in Judge0's response (peak memory used, in KB) is the actual signal — proximity to the configured limit (e.g. ≥90%) is treated as MLE; otherwise it's reported as a genuine RE
+- This is an approximation, not a certainty — it's the same approach most real judges (Codeforces included) use under the hood, since a clean, unambiguous MLE signal generally isn't available from the OS layer
+- **Config check worth doing once, during Judge0 setup (milestone 3):** confirm `ENABLE_PER_PROCESS_AND_OR_THREAD_MEMORY_LIMIT` in `judge0.conf` — if disabled, memory limits still get enforced at the container/cgroup level rather than Judge0's finer per-process accounting, which doesn't change the inference logic above but is worth knowing when interpreting borderline cases
 
 ### 5.7 Contests
 
@@ -829,7 +854,7 @@ function connectWithJitter() {
 **4. Queue + worker, wired end-to-end (still no frontend)**
 - Redis (Upstash) + BullMQ producer (API) / consumer (worker)
 - Worker: pull job → fetch problem/testcases from Postgres → call Judge0 → run checker (**token-diff only for now**, custom checkers come later) → write verdict to `submissions`
-- **✅ Test checkpoint:** seed one problem + testcases via the milestone-2 API, POST a submission directly via curl, confirm the row transitions `queued` → `judging` → `done` with the correct verdict, without touching a browser at all
+- **✅ Test checkpoint:** seed one problem + testcases via the milestone-2 API, POST a submission directly via curl, confirm the row transitions `queued` → `judging` → `done` with the correct verdict, without touching a browser at all. Also submit a deliberately memory-hungry solution (e.g. allocating a huge array) against a low memory limit, and confirm the worker correctly derives `MLE` rather than storing a raw `RE` — this is the one verdict that isn't a direct Judge0 status, so it's worth confirming the inference logic actually fires here rather than assuming it works.
 
 **5. Frontend — landing page, problem browsing, submission**
 - Site landing page: role-adaptive sections (5.1) — test by logging in as each of the 3 roles and confirming the right sections appear/disappear
@@ -931,6 +956,7 @@ function connectWithJitter() {
 - **Contest visibility (`public`/`private`/`restricted`) and user bans are independent mechanisms** — visibility controls who can see/enter a contest at all; bans control what a specific user can do once let in. Restricting a contest is blocked during its live window specifically to avoid it being used (likely by mistake) as a blunt substitute for banning a specific cheater.
 - **Device/session monitoring is a heuristic signal for manual review, not proof.** Every input (device ID, IP, User-Agent) is spoofable by a motivated user; it exists to surface suspicious patterns to an admin, not to auto-detect or auto-ban.
 - **Problem visibility follows the same ownership-or-admin pattern as contest visibility** — an author's private problem is invisible to and unusable by every other author, including when linking problems into a contest by ID; only admins have blanket access across all problems, mirroring the contest ownership rule exactly.
+- **MLE is a derived verdict, not a raw Judge0 status** — Judge0 CE has no dedicated Memory Limit Exceeded status; a memory-killed process reports as a generic Runtime Error variant (status IDs 7–12). The worker infers MLE by checking whether peak memory (Judge0's `memory` field) was at/near the configured limit; this is an approximation used by real judges generally, not a guaranteed-precise signal.
 - **The non-contest submission throttle is a manual, scope-limited admin switch** — it only affects practice submissions (no `contest_id`), never in-contest ones, and must be explicitly toggled on/off by an admin rather than inferred automatically from contest activity.
 - **The landing page adapts content by role but never over-assumes** — a logged-out visitor always sees the participant-level explanation, never a glimpse of author/admin capabilities they don't have.
 - **Penalty (`penalty_minutes_per_wrong`) is a per-contest configurable value, not a hardcoded constant** — defaults to 20 (ICPC convention) but is editable by the contest's creator/admin and displayed explicitly on the contest overview page, so participants never have to assume a fixed rule.
