@@ -58,6 +58,7 @@ enum Verdict {
 }
 
 enum Language {
+  c
   python
   cpp
   java
@@ -288,7 +289,7 @@ model ContestProblem {
 
 /// submissions
 ///   id, user_id, problem_id, contest_id (nullable),
-///   language ('python' | 'cpp' | 'java'),
+///   language ('c' | 'python' | 'cpp' | 'java'),
 ///   source_code, status ('queued'|'judging'|'done'),
 ///   verdict ('AC'|'WA'|'TLE'|'MLE'|'RE'|'CE'|null),
 ///   time_used_ms, memory_used_kb, submitted_at

@@ -529,6 +529,8 @@ async function onVerdict(contestId, userId, problemId, verdict, submittedAt) {
 }
 ```
 
+**Shared Redis instance, separated by key prefix only:** the job queue (milestone 4, BullMQ) and the scoreboard (this section) use the **same single Upstash Redis instance** — no separate database needed. BullMQ automatically namespaces all of its own keys under a `bull:` prefix (e.g. `bull:judge:wait`, `bull:judge:42`); the scoreboard's own keys use the `contest:{contestId}:...` prefix shown above (e.g. `contest:abc123:scoreboard`, `contest:abc123:cell:userX:problemY`). Since Redis is one flat key-value space, this prefix convention is the *only* thing keeping the two systems from colliding — as long as scoreboard code never writes a key starting with `bull:` (no reason it would), the two are fully isolated while sharing one connection string, one free-tier quota, and one `REDIS_URL` in `.env`.
+
 **Delivery to clients: WebSocket push, not polling.**
 - Clients open one WebSocket connection per contest page (with jittered connect delay — see 5.11) and simply listen; they never poll on a timer
 - Every verdict (AC or WA, for any participant) triggers an immediate broadcast of the updated scoreboard to all connected clients for that contest — updates are near-real-time, not bound to a fixed interval

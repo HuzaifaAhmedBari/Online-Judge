@@ -5,6 +5,7 @@ const cors = require('cors');
 
 const authRoutes = require('./routes/auth');
 const problemRoutes = require('./routes/problems');
+const submissionRoutes = require('./routes/submissions');
 const testRoutes = require('./routes/test');
 
 const app = express();
@@ -17,6 +18,7 @@ app.use(express.json({ limit: '1mb' })); // 1MB cap for source code uploads
 // ─── Routes ─────────────────────────────────────────────────────────
 app.use('/api/auth', authRoutes);
 app.use('/api/problems', problemRoutes);
+app.use('/api/submissions', submissionRoutes);
 app.use('/api/test', testRoutes);
 
 // Health check

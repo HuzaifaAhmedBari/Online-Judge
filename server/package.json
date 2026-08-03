@@ -6,16 +6,21 @@
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
+    "worker": "node src/worker.js",
+    "worker:dev": "node --watch src/worker.js",
     "db:generate": "npx prisma generate",
     "db:push": "npx prisma db push",
     "db:studio": "npx prisma studio"
   },
   "dependencies": {
     "@prisma/client": "^6.9.0",
+    "axios": "^1.19.0",
     "bcryptjs": "^2.4.3",
+    "bullmq": "^6.0.5",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "ioredis": "^6.0.0",
     "jsonwebtoken": "^9.0.2"
   },
   "devDependencies": {
