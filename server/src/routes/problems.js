@@ -14,6 +14,10 @@ const VISIBILITIES = new Set(['public', 'private']);
 const EDITABLE_PROBLEM_FIELDS = [
   'title',
   'statement_md',
+  'input_format_md',
+  'output_format_md',
+  'constraints_md',
+  'explanation_md',
   'time_limit_ms',
   'memory_limit_kb',
   'checker_type',
@@ -42,6 +46,15 @@ function validateProblemPayload(body, { partial = false } = {}) {
       return { error: 'statement_md must be a non-empty string.' };
     }
     data.statement_md = body.statement_md;
+  }
+
+  for (const field of ['input_format_md', 'output_format_md', 'constraints_md', 'explanation_md']) {
+    if (!partial || body[field] !== undefined) {
+      if (typeof body[field] !== 'string') {
+        return { error: `${field} must be a string.` };
+      }
+      data[field] = body[field];
+    }
   }
 
   if (!partial || body.time_limit_ms !== undefined) {
@@ -165,11 +178,10 @@ function problemListWhere(user) {
   return { visibility: 'public' };
 }
 
-function serializeProblem(problem, { includeTestcases = false, includeCreator = true } = {}) {
+function serializeProblem(problem, { includeStatement = true, includeTestcases = false, includeCreator = true } = {}) {
   const data = {
     id: problem.id,
     title: problem.title,
-    statement_md: problem.statement_md,
     time_limit_ms: problem.time_limit_ms,
     memory_limit_kb: problem.memory_limit_kb,
     checker_type: problem.checker_type,
@@ -179,6 +191,14 @@ function serializeProblem(problem, { includeTestcases = false, includeCreator = 
     created_at: problem.created_at,
     updated_at: problem.updated_at,
   };
+
+  if (includeStatement) {
+    data.statement_md = problem.statement_md;
+    data.input_format_md = problem.input_format_md;
+    data.output_format_md = problem.output_format_md;
+    data.constraints_md = problem.constraints_md;
+    data.explanation_md = problem.explanation_md;
+  }
 
   if (includeCreator && problem.creator) {
     data.creator = {
@@ -196,6 +216,26 @@ function serializeProblem(problem, { includeTestcases = false, includeCreator = 
   }
 
   return data;
+}
+
+function applyProblemStatuses(problems, submissions) {
+  const statusByProblemId = new Map();
+
+  for (const submission of submissions) {
+    const previous = statusByProblemId.get(submission.problem_id);
+    if (previous === 'solved') continue;
+
+    if (submission.verdict === 'AC') {
+      statusByProblemId.set(submission.problem_id, 'solved');
+    } else if (submission.status === 'done' || submission.verdict) {
+      statusByProblemId.set(submission.problem_id, 'tried');
+    }
+  }
+
+  return problems.map((problem) => ({
+    ...problem,
+    user_status: statusByProblemId.get(problem.id) || 'none',
+  }));
 }
 
 async function writeTestcaseFiles(problemId, testcaseId, input, output) {
@@ -293,7 +333,52 @@ router.get('/', optionalAuthenticate, async (req, res, next) => {
       },
     });
 
-    res.json({ problems: problems.map((problem) => serializeProblem(problem)) });
+    const serializedProblems = problems.map((problem) => serializeProblem(problem, { includeStatement: false }));
+    // Compute latest updated timestamp across problems
+    const latestProblemUpdated = serializedProblems.reduce((m, p) => {
+      const d = new Date(p.updated_at);
+      return d > m ? d : m;
+    }, new Date(0));
+
+    // If unauthenticated or banned or no problems, allow conditional GET based on problems only
+    if (!req.user || req.user.is_banned || serializedProblems.length === 0) {
+      res.setHeader('Last-Modified', latestProblemUpdated.toUTCString());
+      const ifModifiedSince = req.get('If-Modified-Since');
+      if (ifModifiedSince && new Date(ifModifiedSince) >= latestProblemUpdated) {
+        return res.status(304).end();
+      }
+
+      return res.json({ problems: serializedProblems.map((problem) => ({ ...problem, user_status: 'none' })) });
+    }
+
+    // Authenticated user: fetch recent submissions for status and include them in Last-Modified
+    const submissions = await prisma.submission.findMany({
+      where: {
+        user_id: req.user.id,
+        problem_id: { in: serializedProblems.map((problem) => problem.id) },
+      },
+      select: {
+        problem_id: true,
+        status: true,
+        verdict: true,
+        submitted_at: true,
+      },
+      orderBy: { submitted_at: 'desc' },
+    });
+
+    const latestSubmission = submissions.reduce((m, s) => {
+      const d = s.submitted_at ? new Date(s.submitted_at) : new Date(0);
+      return d > m ? d : m;
+    }, new Date(0));
+
+    const overallLatest = latestProblemUpdated > latestSubmission ? latestProblemUpdated : latestSubmission;
+    res.setHeader('Last-Modified', overallLatest.toUTCString());
+    const ifModifiedSince = req.get('If-Modified-Since');
+    if (ifModifiedSince && new Date(ifModifiedSince) >= overallLatest) {
+      return res.status(304).end();
+    }
+
+    return res.json({ problems: applyProblemStatuses(serializedProblems, submissions) });
   } catch (err) {
     next(err);
   }
@@ -358,7 +443,47 @@ router.get('/:id', optionalAuthenticate, async (req, res, next) => {
       return res.status(404).json({ error: 'Problem not found.' });
     }
 
-    res.json({ problem: serializeProblem(problem, { includeTestcases: true }) });
+    // Set Last-Modified for conditional GETs and honor If-Modified-Since
+    const updatedAt = problem.updated_at
+    res.setHeader('Last-Modified', new Date(updatedAt).toUTCString())
+
+    const ifModifiedSince = req.get('If-Modified-Since')
+    if (ifModifiedSince) {
+      const ifSecs = Math.floor(new Date(ifModifiedSince).getTime() / 1000)
+      const updatedSecs = Math.floor(new Date(updatedAt).getTime() / 1000)
+      // Debug log to help diagnose client/server time comparisons
+      console.debug('[conditional-get] If-Modified-Since:', ifModifiedSince, '=>', ifSecs, 'updated_at:', updatedAt, '=>', updatedSecs)
+      if (!Number.isNaN(ifSecs) && ifSecs >= updatedSecs) {
+        return res.status(304).end()
+      }
+    }
+
+    // Read sample testcase contents and include them in the response to avoid extra round-trip
+    const samples = await Promise.all(problem.testcases.map(readTestcaseContent))
+    res.json({ problem: serializeProblem(problem, { includeTestcases: true }), samples })
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/:id/samples', optionalAuthenticate, async (req, res, next) => {
+  try {
+    const problem = await prisma.problem.findUnique({
+      where: { id: req.params.id },
+      include: {
+        testcases: {
+          where: { is_sample: true },
+          orderBy: { ordinal: 'asc' },
+        },
+      },
+    });
+
+    if (!problem || !canViewProblem(problem, req.user)) {
+      return res.status(404).json({ error: 'Problem not found.' });
+    }
+
+    const samples = await Promise.all(problem.testcases.map(readTestcaseContent));
+    return res.json({ samples });
   } catch (err) {
     next(err);
   }

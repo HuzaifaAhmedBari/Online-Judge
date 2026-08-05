@@ -14,14 +14,10 @@ function getJudgeQueue() {
           type: 'exponential',
           delay: 1000,
         },
-        removeOnComplete: {
-          age: 60 * 60,
-          count: 1000,
-        },
-        removeOnFail: {
-          age: 24 * 60 * 60,
-          count: 1000,
-        },
+        // Disable immediate per-job deletion to reduce DEL command churn.
+        // Run periodic batch cleanup with queue.clean() instead.
+        removeOnComplete: false,
+        removeOnFail: false,
       },
     });
   }

@@ -115,7 +115,8 @@ model RoleRequest {
 }
 
 /// problems
-///   id, title, statement_md, time_limit_ms, memory_limit_kb,
+///   id, title, statement_md, input_format_md, output_format_md,
+///   constraints_md, explanation_md, time_limit_ms, memory_limit_kb,
 ///   checker_type ('token' | 'float' | 'custom'), checker_source (nullable),
 ///   visibility ('public' | 'private', default 'public'),
 ///   created_by, created_at, updated_at
@@ -123,6 +124,10 @@ model Problem {
   id              String            @id @default(uuid())
   title           String
   statement_md    String
+  input_format_md String            @default("")
+  output_format_md String           @default("")
+  constraints_md  String            @default("")
+  explanation_md  String            @default("")
   time_limit_ms   Int
   memory_limit_kb Int
   checker_type    CheckerType       @default(token)

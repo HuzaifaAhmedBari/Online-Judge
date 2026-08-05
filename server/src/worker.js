@@ -143,7 +143,9 @@ const worker = new Worker(
   },
   {
     connection: createRedisConnection(),
-    concurrency: Number(process.env.JUDGE_WORKER_CONCURRENCY || 1),
+    // Increase default concurrency to reduce number of worker processes
+    // and therefore duplicate housekeeping Redis commands.
+    concurrency: Number(process.env.JUDGE_WORKER_CONCURRENCY || 4),
   }
 );
 
