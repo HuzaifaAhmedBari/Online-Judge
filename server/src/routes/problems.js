@@ -153,7 +153,6 @@ function validateTestcaseArray(testcases) {
   }
   return null;
 }
-
 function canViewProblem(problem, user) {
   if (problem.visibility === 'public') return true;
   if (!user || user.is_banned) return false;
@@ -277,36 +276,38 @@ async function createTestcases(problemId, testcases) {
   if (!testcases || testcases.length === 0) return [];
 
   const prepared = [];
-  for (let index = 0; index < testcases.length; index += 1) {
-    const { data, error } = validateTestcasePayload(testcases[index], index);
-    if (error) {
-      const err = new Error(error);
-      err.status = 400;
-      throw err;
+  try {
+    for (let index = 0; index < testcases.length; index += 1) {
+      const { data, error } = validateTestcasePayload(testcases[index], index);
+      if (error) {
+        const err = new Error(error);
+        err.status = 400;
+        throw err;
+      }
+
+      const testcaseId = randomUUID();
+      const { inputPath, outputPath } = await writeTestcaseFiles(problemId, testcaseId, data.input, data.output);
+      prepared.push({
+        id: testcaseId,
+        problem_id: problemId,
+        input_path: inputPath,
+        output_path: outputPath,
+        is_sample: data.is_sample,
+        ordinal: data.ordinal,
+      });
     }
 
-    const testcaseId = randomUUID();
-    const { inputPath, outputPath } = await writeTestcaseFiles(
-      problemId,
-      testcaseId,
-      data.input,
-      data.output
-    );
-
-    prepared.push({
-      id: testcaseId,
-      problem_id: problemId,
-      input_path: inputPath,
-      output_path: outputPath,
-      is_sample: data.is_sample,
-      ordinal: data.ordinal,
-    });
+    await prisma.testcase.createMany({ data: prepared });
+  } catch (err) {
+    await Promise.all(prepared.flatMap((testcase) => [
+      fs.rm(testcase.input_path, { force: true }),
+      fs.rm(testcase.output_path, { force: true }),
+    ]));
+    throw err;
   }
 
-  await prisma.testcase.createMany({ data: prepared });
   return prepared.map(({ input_path, output_path, ...testcase }) => testcase);
 }
-
 async function findProblemOr404(problemId) {
   const problem = await prisma.problem.findUnique({
     where: { id: problemId },
@@ -432,10 +433,6 @@ router.get('/:id', optionalAuthenticate, async (req, res, next) => {
         creator: {
           select: { id: true, username: true },
         },
-        testcases: {
-          where: { is_sample: true },
-          orderBy: { ordinal: 'asc' },
-        },
       },
     });
 
@@ -458,9 +455,7 @@ router.get('/:id', optionalAuthenticate, async (req, res, next) => {
       }
     }
 
-    // Read sample testcase contents and include them in the response to avoid extra round-trip
-    const samples = await Promise.all(problem.testcases.map(readTestcaseContent))
-    res.json({ problem: serializeProblem(problem, { includeTestcases: true }), samples })
+    res.json({ problem: serializeProblem(problem) })
   } catch (err) {
     next(err);
   }

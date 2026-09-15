@@ -10,6 +10,7 @@ import ContestsPage from './pages/ContestsPage'
 
 type AuthContextValue = {
   user: User | null
+  authLoading: boolean
   setUser: (user: User | null) => void
   loginUser: (email: string, password: string) => Promise<void>
   registerUser: (username: string, email: string, password: string) => Promise<void>
@@ -26,15 +27,20 @@ export function useAuth() {
 
 export default function App() {
   const [user, setUser] = useState<User | null>(() => loadCachedUser())
+  const [authLoading, setAuthLoading] = useState(() => Boolean(loadCachedUser()))
 
   useEffect(() => {
-    if (!user) return
-    loadMe().then(setUser).catch(() => setUser(null))
+    if (!user) {
+      setAuthLoading(false)
+      return
+    }
+    loadMe().then(setUser).catch(() => setUser(null)).finally(() => setAuthLoading(false))
   }, [])
 
   const value = useMemo<AuthContextValue>(
     () => ({
       user,
+      authLoading,
       setUser,
       loginUser: async (email, password) => setUser(await login(email, password)),
       registerUser: async (username, email, password) => setUser(await register(username, email, password)),
@@ -43,7 +49,7 @@ export default function App() {
         setUser(null)
       },
     }),
-    [user],
+    [user, authLoading],
   )
 
   return (

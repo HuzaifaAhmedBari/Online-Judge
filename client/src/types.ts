@@ -46,6 +46,8 @@ export type Sample = {
   ordinal: number
 }
 
+export type Testcase = Sample
+
 export type Submission = {
   id: string
   user_id: string

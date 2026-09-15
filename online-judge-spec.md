@@ -117,7 +117,11 @@ role_requests
   requested_at, reviewed_by (nullable, references users.id), reviewed_at (nullable)
 
 problems
-  id, title, statement_md, time_limit_ms, memory_limit_kb,
+  id, title,
+  statement_md, input_format_md, output_format_md, explanation_md, constraints_md,
+  -- each a separate markdown blob, parsed and rendered as its own section on the
+  -- problem page (5.3) rather than one combined statement field
+  time_limit_ms, memory_limit_kb,
   checker_type ('token' | 'float' | 'custom'), checker_source (nullable),
   visibility ('public' | 'private', default 'public'),
   created_by, created_at, updated_at
@@ -171,7 +175,7 @@ contest_problems
 
 submissions
   id, user_id, problem_id, contest_id (nullable),
-  language ('python' | 'cpp' | 'java'),
+  language ('python' | 'c' | 'cpp' | 'java'),
   source_code, status ('queued'|'judging'|'done'),
   verdict ('AC'|'WA'|'TLE'|'MLE'|'RE'|'CE'|null),
   -- MLE is a DERIVED label, not a raw Judge0 status — see 5.6 for how it's inferred
@@ -211,7 +215,7 @@ function getLandingContent(user) {
 This is a **static/lightly-templated page**, not a data-heavy one — the adaptive part is just conditional section rendering based on `user.role`, no new backend endpoints beyond the user's own profile data already available on login.
 
 ### 5.2 Problem Authoring (Author, Admin)
-- Form-based statement entry: title, description, input/output format, constraints, notes (stored as markdown)
+- Form-based entry, one section per markdown field: **statement**, **input format**, **output format**, **explanation**, **constraints** — each edited and stored independently (`statement_md`, `input_format_md`, `output_format_md`, `explanation_md`, `constraints_md`), rather than one combined description field
 - Time limit / memory limit fields
 - Test case upload: input/output file pairs, flagged sample vs hidden
 - Checker configuration:
@@ -220,7 +224,7 @@ This is a **static/lightly-templated page**, not a data-heavy one — the adapti
   - `custom`: upload a testlib-style checker source, compiled once and cached as a binary
 
 **Full edit access, ownership-or-admin:**
-- The **creating author** can edit every field of their own problem at any time — statement, time/memory limits, checker configuration, test cases (add/replace/remove input-output pairs), and visibility
+- The **creating author** can edit every field of their own problem at any time — all five markdown sections, time/memory limits, checker configuration, test cases (add/replace/remove input-output pairs), and visibility
 - **Admins can edit any problem** in full, regardless of who created it — same fields, same capability, no restriction
 - No other author can edit a problem they didn't create, regardless of its visibility (a public problem is viewable/addable-to-contests by any author, per 5.7, but still only editable by its creator or an admin)
 ```javascript
@@ -230,7 +234,8 @@ app.patch('/api/problems/:id', async (req, res) => {
   const isAdmin = req.user.role === 'admin';
   if (!isOwner && !isAdmin) return res.status(403).json({ error: 'Only the creator or an admin can edit this problem.' });
 
-  // statement_md, time_limit_ms, memory_limit_kb, checker_type/checker_source, visibility all editable here
+  // statement_md, input_format_md, output_format_md, explanation_md, constraints_md,
+  // time_limit_ms, memory_limit_kb, checker_type/checker_source, visibility all editable here
   await prisma.problems.update({ where: { id: req.params.id }, data: req.body });
 });
 // Test case add/replace/remove endpoints follow the identical isOwner-or-isAdmin check
@@ -248,7 +253,24 @@ app.patch('/api/problems/:id', async (req, res) => {
 
 ### 5.3 Problem Browsing & Layout
 - List/filter problems (visible to logged-out users too) — **private problems are excluded from this listing for everyone except their creating author and admins**
-- Problem detail page: **split-view, single page** — statement (description, I/O format, constraints, samples) on one side, Monaco editor + submission controls on the other (side-by-side on desktop; stacked/tab-toggle on narrow/mobile viewports). Not a separate page for the editor — users need constant reference to the statement while coding.
+- Problem detail page: **split-view, single page** — statement on one side, Monaco editor + submission controls on the other (side-by-side on desktop; stacked/tab-toggle on narrow/mobile viewports). Not a separate page for the editor — users need constant reference to the statement while coding.
+
+**Statement is composed of separate markdown sections, not one blob:**
+- `statement_md`, `input_format_md`, `output_format_md`, `explanation_md`, `constraints_md` are each stored and edited as their own field (5.2's authoring form has a section per field), and rendered as their own labeled section on the problem page, in that order — description → input format → output format → explanation → constraints — followed by the sample test cases
+- Each is parsed as markdown independently (same renderer, just called once per section); an empty field simply omits that section from the rendered page rather than showing a blank heading
+
+**Separate endpoint for sample test cases only:**
+- `GET /api/problems/:id/samples` returns just the test cases flagged `is_sample = true` for that problem — kept separate from the main problem-fetch endpoint so the (typically small) sample set can be fetched/cached independently of the full markdown payload, and so the problem page can render statement sections and samples as they arrive rather than waiting on one large combined response
+```javascript
+app.get('/api/problems/:id/samples', async (req, res) => {
+  const samples = await prisma.testcases.findMany({
+    where: { problem_id: req.params.id, is_sample: true },
+    orderBy: { ordinal: 'asc' }
+  });
+  res.json(samples); // input/output pairs only — never exposes hidden test cases
+});
+```
+- This endpoint follows the same visibility check as the main problem endpoint (private problems' samples are equally restricted to creator + admin)
 
 **Client-side caching, once loaded:**
 - The first time a problem's statement is fetched, cache it in the browser (`sessionStorage`, keyed by problem ID) — subsequent visits to that same problem in the same session read straight from the cache, no repeat DB query
@@ -265,7 +287,7 @@ async function loadProblem(problemId) {
     return cached.data; // cache hit, no full-statement fetch needed
   }
 
-  // Cache miss or stale — fetch the full problem, then cache it
+  // Cache miss or stale — fetch the full problem (all markdown fields), then cache it
   const fresh = await fetch(`/api/problems/${problemId}`).then(r => r.json());
   sessionStorage.setItem(cacheKey, JSON.stringify({ updatedAt: fresh.updatedAt, data: fresh }));
   return fresh;
@@ -276,11 +298,12 @@ async function loadProblem(problemId) {
 
 ### 5.4 Code Submission
 
-**Supported languages: Python, C++, Java only.**
+**Supported languages: Python, C, C++, Java.**
 
 | Language | Judge0 `language_id`* | Notes |
 |---|---|---|
 | Python | 71 (verify against your Judge0 instance's `/languages`) | No special constraints |
+| C | 50 (GCC 9.2.0) or similar (verify against your instance) | No special constraints |
 | C++ | 54 or 76 (pick one standard, e.g. C++17) | No special constraints |
 | Java | 62 | Public class **must be named `Main`** — Judge0 must write your code to a file before compiling, and the JVM requires the file name to match the public class name. Document this requirement near the language selector; optionally add a client-side regex check (`public class Main`) to warn before submission rather than surfacing a cryptic Compile Error. |
 
@@ -289,15 +312,32 @@ async function loadProblem(problemId) {
 **Two input methods, unified into one submission path:**
 - **Type directly in Monaco** — standard editing experience
 - **Upload a file** — file picker/drag-and-drop; on upload, read the file as text and load it into the Monaco editor via `editor.setValue(contents)` (rather than a separate upload endpoint) so the user can review/edit before submitting, and the rest of the pipeline only ever deals with one code path: `editor.getValue()` at submit time
-  - Auto-detect language from file extension (`.py`/`.cpp`/`.java`) and pre-select the language dropdown, allowing override
-  - Restrict file picker `accept` to `.py,.cpp,.java`; enforce a reasonable size cap (e.g. 1MB) server-side
+  - Auto-detect language from file extension (`.py`/`.c`/`.cpp`/`.java`) and pre-select the language dropdown, allowing override
+  - Restrict file picker `accept` to `.py,.c,.cpp,.java`; enforce a reasonable size cap (e.g. 1MB) server-side
 
 **Submission flow:**
 - Monaco Editor captures code via `editor.getValue()` on submit click
-- Language selection mapped to both Monaco's syntax-highlight language and Judge0's `language_id` via an explicit 3-entry mapping table
+- Language selection mapped to both Monaco's syntax-highlight language and Judge0's `language_id` via an explicit 4-entry mapping table
 - POST `{ problem_id, language, source_code }` → API creates submission row (`status: queued`) → pushes job to Redis queue
   - Server rejects the request if the requesting user `is_banned` (see 5.9) or not authenticated (contest submissions require login)
-- Frontend shows live status (queued → judging → verdict) via polling or WebSocket push
+  - **Contest submissions: once a user has an AC on a given problem within a contest, further submissions to that same problem in that same contest are rejected** — the problem is "closed" for them once solved, since there's nothing further to gain and it avoids needless judging load
+```javascript
+app.post('/api/submissions', async (req, res) => {
+  // ... existing ban/end-time/visibility checks ...
+  if (req.body.contest_id) {
+    const alreadyAC = await prisma.submissions.findFirst({
+      where: { user_id: req.user.id, problem_id: req.body.problem_id, contest_id: req.body.contest_id, verdict: 'AC' }
+    });
+    if (alreadyAC) return res.status(409).json({ error: 'You have already solved this problem in this contest.' });
+  }
+  // ... create submission, push to queue ...
+});
+```
+  - This check does **not** apply to non-contest (practice) submissions — resubmitting a solved practice problem is always allowed, since there's no ranking/penalty concept to protect there
+
+**Live status, two different mechanisms for two different audiences:**
+- **My Submissions tab (5.5)**: the submitting user's own view of their in-flight submission — tracked via **short-interval polling** scoped to just that one submission ID (`GET /api/submissions/:id` every ~1s until `status: done`), not a WebSocket channel. This is deliberately different from the scoreboard's push design: one user watching their own short-lived submission is low-frequency enough that simple polling is the simpler, sufficient choice here.
+- **Scoreboard cell (5.8)**: shows a transient **blue "judging" state** the instant a submission for that (user, problem) starts being processed, pushed via the same WebSocket broadcast used for verdicts — see 5.8 for how this interacts with the persisted green/red states.
 
 ### 5.5 Submission History (per user, per contest)
 
@@ -326,6 +366,20 @@ async function viewSubmission(submissionId) {
 
 - A "Copy" button on the viewed code uses `navigator.clipboard.writeText(code)`.
 - Scope this endpoint server-side to **only return code for submissions owned by the requesting user** (or, for admins, any user's — see 5.9) — never trust the submission ID alone as authorization.
+
+**Live status for in-flight submissions (`queued` → `judging` → verdict):**
+- Any row still in `status: queued` or `judging` is tracked via **short-interval polling scoped to just that one submission** (`GET /api/submissions/:id`, e.g. every ~1s), stopping once `status: done`
+```javascript
+function trackSubmission(submissionId, onUpdate) {
+  const interval = setInterval(async () => {
+    const data = await fetch(`/api/submissions/${submissionId}`).then(r => r.json());
+    onUpdate(data.status, data.verdict);
+    if (data.status === 'done') clearInterval(interval);
+  }, 1000);
+}
+```
+- This is intentionally **not** the WebSocket broadcast used by the scoreboard (5.8) — one user watching their own single, short-lived submission is low-frequency enough that simple polling is the simpler, sufficient choice; the WebSocket design is specifically for many users watching shared, continuously-changing state across a whole contest
+- Once `status: done`, the row's verdict is final and immutable — no further polling needed, and the row now behaves exactly as described above (code fetch on click, cached in `sessionStorage`)
 
 ### 5.6 Judging Pipeline
 ```
@@ -372,23 +426,47 @@ function mapJudge0StatusToVerdict(judge0Status, memoryUsedKb, memoryLimitKb) {
 
 **Time-boxed set of problems** (`contest_problems`), ICPC-style scoring: rank by most-solved (desc), then least-penalty (asc).
 
-**Contest overview page (landing page for the contest itself):** after entering a contest (password gate cleared if `private`, identity check passed if `restricted`), the user lands on an overview page **before** the Problems/Scoreboard/My Submissions tabs — this is the contest's own "front page":
+**Contest sub-pages, once entered** (password gate cleared if `private`, identity check passed if `restricted`): `[Dashboard] [Problems] [Leaderboard] [My Submissions]` — Dashboard is the landing sub-page, the others as previously designed (Problems = split-view editor scoped to the contest, Leaderboard = the live scoreboard from 5.8, My Submissions = the per-contest history from 5.5).
+
+**Dashboard:**
 ```
 Contest: Weekly Practice #3
 Runs: Aug 1, 10:00 AM – 1:00 PM (3 hours)
+Starts in: 02:14:37   ← countdown, computed from SERVER time, not the browser's own clock
 Problems: 7
 Scoring: ICPC-style — most solved, tiebreak by least penalty
 Penalty: +{penalty_minutes_per_wrong} minutes per wrong submission before a problem's first accepted solution
 
-Problems:
-  A — Two Sum              [Enter →]
-  B — Binary Search Tree    [Enter →]
-  C — Graph Coloring         [Enter →]
-  ...
+[Problems not yet visible — contest hasn't started]
 ```
-- **Metadata shown:** problem count, start/end time (and duration), scoring rule in plain language, and the contest's actual **configured penalty value** (`penalty_minutes_per_wrong`, default 20 but editable per contest by its creator/admin per the full-edit rule below) spelled out explicitly rather than left as an assumed constant
-- **Problem list**: label + title, each linking directly into that problem's split-view submission page (5.4's layout), scoped to this contest
-- This overview is the natural landing point for `[Problems]` in the tab bar — clicking a problem row here is equivalent to opening it from that tab; both routes lead to the same problem page
+- **Metadata (title, timing, problem count, scoring rule, configured penalty value) is always shown**, regardless of whether the contest has started — this comes from the `contests` row itself, which is fetched immediately once access is granted, independent of problem visibility below
+- **The countdown is computed from server time**, not the visitor's local clock, for the same reason as the submission-cutoff timer in 5.8 — a wrong or deliberately-altered local clock shouldn't affect what a user sees. Reuse the same mechanism already established there: either a client/server clock-offset via `/api/server-time`, or (preferred, and now needed for *both* boundaries) the server pushes `{ type: 'contest_started' }` over the same WebSocket channel at the exact instant `start_time` passes, scheduled identically to the existing `{ type: 'contest_ended' }` push
+- **Problem list is withheld by the backend until `start_time`, not just hidden in the UI:**
+```javascript
+app.get('/api/contests/:id/problems', async (req, res) => {
+  await requireContestAccess(req.user.id, req.params.id); // password/identity gate, as before
+  const contest = await prisma.contests.findUnique({ where: { id: req.params.id } });
+  if (new Date() < contest.start_time) {
+    return res.json({ started: false, problems: [] }); // deliberately empty — nothing to leak early
+  }
+  const problems = await prisma.contest_problems.findMany({ where: { contest_id: req.params.id }, include: { problem: true }, orderBy: { label: 'asc' } });
+  res.json({ started: true, problems });
+});
+```
+  - This holds even for a user who already cleared a private contest's password ahead of time — password access and start-time access are two separate gates; clearing one doesn't bypass the other
+  - Once problems are visible, each row shows **label + title** with an **`[Enter →]` button that opens the Problems sub-page pre-scoped to that specific problem** (not the general public problem list) — clicking a row and switching to the `[Problems]` tab directly both land on the same place
+- **Dashboard auto-refreshes the instant the contest goes live** — on receiving the `{ type: 'contest_started' }` WebSocket push, the Dashboard re-fetches `/api/contests/:id/problems` and replaces the "not yet visible" state with the real problem list, with no manual refresh needed:
+```javascript
+socket.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.type === 'contest_started') refetchProblemList(); // Dashboard swaps state automatically
+  if (msg.type === 'contest_ended') disableSubmitButton(); // existing behavior, 5.8
+};
+```
+
+**Problems sub-page:**
+- Split-view editor (5.4's layout), scoped to the contest, with a way to **navigate between the contest's problems** (e.g. a label switcher — A/B/C/D tabs or a dropdown) without leaving the sub-page
+- **Once a problem is AC'd, it becomes non-resubmittable** — the Submit button reflects this directly (disabled, replaced with a "Solved ✓" indicator) rather than only relying on the server's 409 rejection (5.4) to communicate it after the fact; the server-side check remains the actual guardrail regardless of what the button shows, same "cosmetic UI, real server enforcement" principle as the contest end-time cutoff
 
 **Full edit access, ownership-or-admin:** once a contest exists, its **creator** and any **admin** can edit it at any time — title/description, `start_time`/`end_time`, `penalty_minutes_per_wrong`, add or remove problems (by ID, subject to the visibility rule in the next section), and visibility mode. No other author can modify a contest they didn't create.
 ```javascript
@@ -434,7 +512,7 @@ async function enterContest(userId, contestId, password) {
   return { ok: true };
 }
 ```
-Every contest-scoped route (problems, scoreboard, submission) checks `contest_access` the same way — once granted, switching between Problems/Scoreboard/My Submissions tabs or refreshing never re-prompts. If the contest is later made `public`, access rows become irrelevant (the `visibility` flag gates access, not row presence); if flipped back to `private` later, **previously granted rows still count** — access, once given, is permanent.
+Every contest-scoped route (problems, scoreboard, submission) checks `contest_access` the same way — once granted, switching between Dashboard/Problems/Leaderboard/My Submissions tabs or refreshing never re-prompts. If the contest is later made `public`, access rows become irrelevant (the `visibility` flag gates access, not row presence); if flipped back to `private` later, **previously granted rows still count** — access, once given, is permanent.
 
 **Restricted mode**: purely identity-based, no password bypass possible.
 ```javascript
@@ -492,11 +570,25 @@ app.post('/api/contests/:contestId/problems', async (req, res) => {
 
 | Cell state | Display |
 |---|---|
+| **Currently being judged** (transient — see below) | Blue, no time/count shown — purely "something is in flight" |
 | Solved, no prior wrong attempts | Solve time in green, e.g. `12:04` |
 | Solved, N prior wrong attempts | `12:04 +2` in green (the `+2` folded into penalty) |
 | First solve of that problem across the entire contest | Same as above, additionally marked (star/trophy/gold highlight — "first blood") |
 | Attempted, not yet solved | Wrong count in red, e.g. `WA×2` |
 | Not attempted | Blank |
+
+**Transient "judging" state (blue), separate from persisted cell state:**
+- The instant a submission for a (user, problem) pair starts being judged — i.e. the worker marks it `status: judging`, **before** calling Judge0 — broadcast a lightweight, **non-persisted** cell update:
+```javascript
+async function onJudgingStarted(contestId, userId, problemId) {
+  const cell = scoreboardState[contestId]?.[userId]?.[problemId];
+  if (cell?.solved) return; // already green — don't flicker blue over an already-solved cell
+
+  broadcastCellUpdate(contestId, userId, problemId, { status: 'judging' }); // blue — not written to Postgres or Redis
+}
+```
+- This is **never written to Postgres or Redis** — it's not real scoreboard data, just a live "something is happening" signal for the duration of judging. The moment the actual verdict lands, the existing `onVerdict` flow below fires and overwrites the cell with the real, persisted color (green/red)
+- If the (user, problem) cell is already solved (green), a further submission (which, per 5.4, is blocked for contest problems anyway once AC'd) would never trigger this in practice — the guard above exists mainly for defensive correctness
 
 **Two things update at different rates, both driven by every verdict:**
 1. **Per-cell state** (wrong count, solved flag, solve time) — must update on **every** verdict (AC or WA), not just AC, so red wrong-attempt cells appear live rather than only becoming visible retroactively once a user eventually solves that problem
@@ -741,7 +833,7 @@ function getOrCreateDeviceId() {
   if (!id) { id = crypto.randomUUID(); localStorage.setItem('device_id', id); }
   return id;
 }
-// Sent on WebSocket connect for any contest-scoped page (Problems/Scoreboard/My Submissions)
+// Sent on WebSocket connect for any contest-scoped page (Dashboard/Problems/Leaderboard/My Submissions)
 socket.send(JSON.stringify({ type: 'session_info', deviceId: getOrCreateDeviceId() }));
 ```
 ```javascript
@@ -851,7 +943,7 @@ function connectWithJitter() {
 
 **3. Judge0 standalone (local, isolated from the rest of the app)**
 - `docker-compose up -d` Judge0 locally
-- **✅ Test checkpoint:** raw `curl` submissions directly against Judge0's own `/submissions` endpoint (bypassing your API entirely) for at least 2 of the 3 languages — confirm compile, stdout, exit status, time, and memory all report correctly. This validates Judge0 in isolation before anything in your app depends on it.
+- **✅ Test checkpoint:** raw `curl` submissions directly against Judge0's own `/submissions` endpoint (bypassing your API entirely) for at least 2 of the 4 languages — confirm compile, stdout, exit status, time, and memory all report correctly. This validates Judge0 in isolation before anything in your app depends on it.
 
 **4. Queue + worker, wired end-to-end (still no frontend)**
 - Redis (Upstash) + BullMQ producer (API) / consumer (worker)
@@ -863,15 +955,18 @@ function connectWithJitter() {
 - Problem list/detail pages, `sessionStorage` caching keyed by problem ID + `updated_at` invalidation
 - Monaco editor + language selector + Judge0 language-id mapping + file upload
 - Submit → POST → poll/display verdict
-- **✅ Test checkpoint:** as a participant in the browser, browse to a problem, submit working and broken solutions in each of the 3 languages, see correct verdicts appear; edit the problem as its author, refresh, confirm the cached copy updates rather than showing stale content
+- **✅ Test checkpoint:** as a participant in the browser, browse to a problem, submit working and broken solutions in each of the 4 languages, see correct verdicts appear; edit the problem as its author, refresh, confirm the cached copy updates rather than showing stale content
 
-**6. Contests — structure and access, no scoreboard yet**
-- Contest CRUD (`penalty_minutes_per_wrong` included), contest overview/landing page (5.7)
+**6. Contests — structure and access, no leaderboard yet**
+- Contest CRUD (`penalty_minutes_per_wrong` included), Dashboard/Problems/Leaderboard/My Submissions sub-page structure (5.7) — Leaderboard itself is stubbed/empty until milestone 7
 - `contest_problems` linking by problem ID, with the dual ownership check (contest-edit permission + problem-visibility permission)
 - Three visibility modes: password entry + `contest_access` lifetime grant for private; identity gate + listing exclusion for restricted; ownership-or-admin for visibility changes; live-window guard blocking transition to `restricted`
+- **Problem list withheld until `start_time`**: `GET /api/contests/:id/problems` returns `{ started: false, problems: [] }` before the contest starts, regardless of password/access already granted; Dashboard shows contest metadata unconditionally but the problem list only once `started: true`
+- `{ type: 'contest_started' }` WebSocket push at the exact instant `start_time` passes (mirrors the existing `contest_ended` push), triggering the Dashboard to auto-refetch and reveal the problem list without a manual reload
+- Countdown timer on Dashboard driven by server time (clock-offset or WebSocket push), not the browser's own clock
 - Submissions tagged with `contest_id`; server-side `now > end_time` cutoff enforced (cosmetic disabled-button state is a separate, later frontend touch, not required for this checkpoint)
 - Admin-only global toggle to pause non-contest submissions
-- **✅ Test checkpoint:** create a public, a private (with password), and a restricted contest as different users; confirm listing visibility matches the table in 5.7; confirm a second author cannot add a third author's private problem to their own contest; confirm submitting after manually editing `end_time` into the past is rejected with a 403
+- **✅ Test checkpoint:** create a public, a private (with password), and a restricted contest as different users; confirm listing visibility matches the table in 5.7; confirm a second author cannot add a third author's private problem to their own contest; confirm submitting after manually editing `end_time` into the past is rejected with a 403; separately, create a contest with `start_time` a minute in the future, enter it early (password cleared if private), confirm the Dashboard shows metadata but no problems, and confirm the problem list appears automatically once `start_time` passes without refreshing the page
 
 **7. Scoreboard — split into sub-steps, each independently verifiable:**
 
@@ -963,3 +1058,8 @@ function connectWithJitter() {
 - **The landing page adapts content by role but never over-assumes** — a logged-out visitor always sees the participant-level explanation, never a glimpse of author/admin capabilities they don't have.
 - **Penalty (`penalty_minutes_per_wrong`) is a per-contest configurable value, not a hardcoded constant** — defaults to 20 (ICPC convention) but is editable by the contest's creator/admin and displayed explicitly on the contest overview page, so participants never have to assume a fixed rule.
 - **Problem statement caching uses a cheap metadata check for invalidation, not a blind infinite cache** — comparing cached vs. current `updated_at` avoids showing stale content after an author edits a problem mid-session, at the cost of one small request per visit rather than the full statement payload every time.
+- **A contest problem "closes" once AC'd — resubmission is rejected, not silently allowed.** This only applies within contests (where ranking/penalty are at stake); practice submissions to an already-solved problem remain unrestricted, since there's no ranking concept to protect there.
+- **The transient "judging" (blue) scoreboard state is never persisted** — it exists purely as a live signal broadcast the instant judging starts, and is fully overwritten by the real, persisted verdict color the moment it's available. Postgres and Redis only ever store final verdicts, never the in-flight state.
+- **In-flight submission status (My Submissions tab) uses simple polling, not WebSocket push** — deliberately different from the scoreboard's design, since one user tracking their own single short-lived submission doesn't warrant the same infrastructure built for many users watching shared, continuously-changing contest-wide state.
+- **The problem statement is five independently-stored markdown fields** (`statement_md`, `input_format_md`, `output_format_md`, `explanation_md`, `constraints_md`), not one combined blob — each renders as its own labeled section, and an empty field simply omits that section rather than showing a blank heading.
+- **Contest problems are withheld by the backend until `start_time`, not merely hidden in the UI** — clearing a private contest's password grants entry to the Dashboard, but the problem list itself stays empty at the API level until the contest is actually live, so there's no way to see problems early by inspecting network responses. The Dashboard auto-reveals them via the same server-pushed WebSocket event pattern already used for the end-time cutoff, now mirrored for the start boundary too.

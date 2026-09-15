@@ -3,7 +3,7 @@ import type { FormEvent, ReactNode } from 'react'
 import { useNavigate, useParams, Link } from 'react-router-dom'
 import TopNav from '../components/TopNav'
 import { useAuth } from '../App'
-import { createProblem, loadProblem, updateProblem, addTestcases, updateTestcase, deleteTestcase } from '../services/problems'
+import { createProblem, loadProblem, fetchTestcases, updateProblem, addTestcases, updateTestcase, deleteTestcase } from '../services/problems'
 import type { Problem, ProblemPayload } from '../types'
 
 type ProblemFormPageProps = {
@@ -25,22 +25,27 @@ const emptyProblem: Omit<ProblemPayload, 'testcases'> = {
 
 export default function ProblemFormPage({ mode }: ProblemFormPageProps) {
   const { id = '' } = useParams()
-  const { user } = useAuth()
+  const { user, authLoading } = useAuth()
   const navigate = useNavigate()
   const [form, setForm] = useState(emptyProblem)
   
   const [samples, setSamples] = useState<Array<{ id?: string; input: string; output: string; is_sample?: boolean; ordinal?: number; _deleted?: boolean }>>([])
   const [loadedProblem, setLoadedProblem] = useState<Problem | null>(null)
   const [initialForm, setInitialForm] = useState<Omit<ProblemPayload, 'testcases'> | null>(null)
-  const [initialSamples, setInitialSamples] = useState<Array<{ id?: string | null; input: string; output: string }>>([])
+  const [initialSamples, setInitialSamples] = useState<Array<{ id?: string | null; input: string; output: string; is_sample?: boolean; ordinal?: number }>>([])
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [loading, setLoading] = useState(mode === 'edit')
   const canAuthor = user?.role === 'author' || user?.role === 'admin'
 
   useEffect(() => {
-    if (mode !== 'edit') return
-    loadProblem(id)
-      .then(({ problem, samples: loadedSamples }) => {
+    if (mode !== 'edit') {
+      setLoading(false)
+      return
+    }
+    setLoading(true)
+    Promise.all([loadProblem(id), fetchTestcases(id)])
+      .then(([{ problem }, loadedTestcases]) => {
         setLoadedProblem(problem)
         setForm({
           title: problem.title,
@@ -54,7 +59,7 @@ export default function ProblemFormPage({ mode }: ProblemFormPageProps) {
           checker_type: problem.checker_type === 'float' ? 'float' : 'token',
           visibility: problem.visibility,
         })
-        const mapped = loadedSamples.map(s => ({ id: s.id, input: s.input, output: s.output, is_sample: s.is_sample, ordinal: s.ordinal }))
+        const mapped = loadedTestcases.map(s => ({ id: s.id, input: s.input, output: s.output, is_sample: s.is_sample, ordinal: s.ordinal }))
         setSamples(mapped)
         setInitialForm({
           title: problem.title,
@@ -68,9 +73,10 @@ export default function ProblemFormPage({ mode }: ProblemFormPageProps) {
           checker_type: problem.checker_type === 'float' ? 'float' : 'token',
           visibility: problem.visibility,
         })
-        setInitialSamples(mapped.map(s => ({ id: s.id || null, input: s.input, output: s.output })))
+        setInitialSamples(mapped.map(s => ({ id: s.id || null, input: s.input, output: s.output, is_sample: s.is_sample, ordinal: s.ordinal })))
       })
       .catch((err) => setError(err instanceof Error ? err.message : 'Could not load problem.'))
+      .finally(() => setLoading(false))
   }, [id, mode])
 
   const canEditLoaded = mode === 'create' || Boolean(user && loadedProblem && (user.role === 'admin' || loadedProblem.created_by === user.id))
@@ -88,7 +94,7 @@ export default function ProblemFormPage({ mode }: ProblemFormPageProps) {
 
     if (JSON.stringify(form) !== JSON.stringify(initialForm)) return true
 
-    const norm = (arr: typeof samples) => arr.filter((s) => !s._deleted).map((s) => ({ id: s.id || null, input: s.input || '', output: s.output || '' }))
+    const norm = (arr: typeof samples) => arr.filter((s) => !s._deleted).map((s) => ({ id: s.id || null, input: s.input || '', output: s.output || '', is_sample: Boolean(s.is_sample), ordinal: s.ordinal }))
     try {
       if (JSON.stringify(norm(samples)) !== JSON.stringify(initialSamples)) return true
     } catch (e) {
@@ -119,7 +125,12 @@ export default function ProblemFormPage({ mode }: ProblemFormPageProps) {
 
         // Persist samples: delete marked, update existing, and add new drafts
         const samplesToDelete = samples.filter((s) => s.id && s._deleted)
-        const existingSamplesToUpdate = samples.filter((s) => s.id && !s._deleted)
+        const initialById = new Map(initialSamples.filter((s) => s.id).map((s) => [s.id, s]))
+        const existingSamplesToUpdate = samples.filter((s) => {
+          if (!s.id || s._deleted) return false
+          const initial = initialById.get(s.id)
+          return !initial || initial.input !== s.input || initial.output !== s.output || initial.is_sample !== Boolean(s.is_sample) || initial.ordinal !== s.ordinal
+        })
         const newSamples = samples.filter((s) => !s.id && !s._deleted && s.input?.trim() && s.output?.trim())
 
         // Delete marked samples
@@ -129,12 +140,12 @@ export default function ProblemFormPage({ mode }: ProblemFormPageProps) {
 
         // Update existing samples
         if (existingSamplesToUpdate.length > 0) {
-          await Promise.all(existingSamplesToUpdate.map((s) => updateTestcase(id, s.id as string, { input: s.input, output: s.output })))
+          await Promise.all(existingSamplesToUpdate.map((s) => updateTestcase(id, s.id as string, { input: s.input, output: s.output, is_sample: Boolean(s.is_sample), ordinal: s.ordinal })))
         }
 
         // Add new samples in batch if any
         if (newSamples.length > 0) {
-          await addTestcases(id, newSamples.map((s) => ({ input: s.input, output: s.output, is_sample: true })))
+          await addTestcases(id, newSamples.map((s) => ({ input: s.input, output: s.output, is_sample: Boolean(s.is_sample) })))
         }
 
         // Refresh cache and UI
@@ -149,6 +160,23 @@ export default function ProblemFormPage({ mode }: ProblemFormPageProps) {
     }
   }
 
+  if (authLoading || loading) {
+    return (
+      <div className="min-h-screen bg-black text-on-surface">
+        <TopNav />
+        <main className="max-w-3xl mx-auto px-gutter py-12">Loading problem editor...</main>
+      </div>
+    )
+  }
+
+  if (error && mode === 'edit' && !loadedProblem) {
+    return (
+      <div className="min-h-screen bg-black text-on-surface">
+        <TopNav />
+        <main className="max-w-3xl mx-auto px-gutter py-12 text-error">{error}</main>
+      </div>
+    )
+  }
   if (!canAuthor) {
     return (
       <div className="relative min-h-screen bg-black text-on-surface code-grid-bg overflow-hidden">
@@ -233,9 +261,9 @@ export default function ProblemFormPage({ mode }: ProblemFormPageProps) {
           <MarkdownField label="Explanation.md" value={form.explanation_md} onChange={(value) => setForm({ ...form, explanation_md: value })} />
           {(mode === 'create' || mode === 'edit') ? (
             <div className="grid gap-4 border-t border-outline-variant pt-5">
-              <h3 className="font-data-label text-data-label text-outline uppercase tracking-wider mb-2">Sample Testcases</h3>
-              {/* In create mode show Samples area then Testcases area separated by a line; edit mode shows combined list */}
-              {mode === 'create' ? (
+              <h3 className="font-data-label text-data-label text-outline uppercase tracking-wider mb-2">Samples and Main Testcases</h3>
+              {/* Samples and hidden/main testcases are edited together from the complete testcase list. */}
+              {mode === 'create' || mode === 'edit' ? (
                 <>
                   <div>
                     {samples.filter(s => !s._deleted && (s.is_sample !== false)).map((s, idx) => (
